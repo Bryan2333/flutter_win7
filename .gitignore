@@ -1,0 +1,11 @@
+# Local research clone of YY-Thunks (depth 1), used for the Windows 7 API
+# database in src/YY.Depends.Analyzer/Config. CI checks out its own copy.
+YY-Thunks/
+
+# Engine checkouts / build outputs created by the workflow or by hand.
+flutter/
+dist/
+
+# Downloaded YY-Thunks releases + extracted copies (kept out of git).
+vendor/
+*.zip

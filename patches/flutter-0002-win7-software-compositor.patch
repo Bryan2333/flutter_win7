@@ -1,0 +1,59 @@
+diff --git a/engine/src/flutter/shell/platform/windows/egl/manager.cc b/engine/src/flutter/shell/platform/windows/egl/manager.cc
+index 64fb765bf54..d2c67bebeb9 100644
+--- a/engine/src/flutter/shell/platform/windows/egl/manager.cc
++++ b/engine/src/flutter/shell/platform/windows/egl/manager.cc
+@@ -12,9 +12,54 @@
+ namespace flutter {
+ namespace egl {
+ 
++namespace {
++// The real OS version, asked of the kernel rather than of VersionHelpers.
++// IsWindows10OrGreater goes through VerifyVersionInfo, which answers with the
++// highest OS the HOST EXE's manifest claims to support — an engine-side gate
++// must not silently change behaviour because an embedder in another
++// repository edited its manifest. RtlGetVersion has no such lie in it.
++bool IsBelowWindows10() {
++  static const bool is_below_windows10 = [] {
++    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
++    auto* const ntdll = ::GetModuleHandleW(L"ntdll.dll");
++    if (ntdll == nullptr) {
++      return false;
++    }
++    const auto rtl_get_version = reinterpret_cast<RtlGetVersionFn>(
++        ::GetProcAddress(ntdll, "RtlGetVersion"));
++    if (rtl_get_version == nullptr) {
++      return false;
++    }
++    OSVERSIONINFOW info = {};
++    info.dwOSVersionInfoSize = sizeof(info);
++    if (rtl_get_version(&info) != 0) {
++      return false;
++    }
++    return info.dwMajorVersion < 10;
++  }();
++  return is_below_windows10;
++}
++}  // namespace
++
+ int Manager::instance_count_ = 0;
+ 
+ std::unique_ptr<Manager> Manager::Create(GpuPreference gpu_preference) {
++  // Below Windows 10, never initialize EGL/ANGLE: a null manager sends the
++  // engine to its software compositor. The policy line is upstream's own
++  // tested envelope — Flutter tests Windows 10+ and nothing older, so on
++  // 10+ this branch is never taken and rendering behaves bit-for-bit as
++  // unpatched, while everything below the envelope takes the one path
++  // validated end-to-end there (Skia's CPU rasterizer + a GDI blit; full-UI
++  // verified on Windows 7). The GPU paths below the envelope are decade-old
++  // driver populations with an unrecoverable failure mode — the renderer is
++  // chosen once at Run(), so a device loss after EGL initialized has no way
++  // back to software, only a permanently black window — and Windows 8.0
++  // additionally lacks d3dcompiler_47 in System32, which the lazily-loading
++  // shader compiler turns into the same black window. Availability over
++  // acceleration, by decision.
++  if (IsBelowWindows10()) {
++    return nullptr;
++  }
+   std::unique_ptr<Manager> manager;
+   manager.reset(new Manager(gpu_preference));
+   if (!manager->IsValid()) {

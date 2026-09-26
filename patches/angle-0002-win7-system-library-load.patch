@@ -1,0 +1,27 @@
+diff --git a/src/common/system_utils_win32.cpp b/src/common/system_utils_win32.cpp
+index f7423cd..09a00fd 100644
+--- a/src/common/system_utils_win32.cpp
++++ b/src/common/system_utils_win32.cpp
+@@ -88,6 +88,22 @@ void *OpenSystemLibraryWithExtensionAndGetError(const char *libraryName,
+         {
+             libraryModule =
+                 LoadLibraryExW(Widen(libraryName).c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++            if (libraryModule == nullptr && GetLastError() == ERROR_INVALID_PARAMETER)
++            {
++                // Win7 compat: without KB2533623 every LOAD_LIBRARY_SEARCH_*
++                // flag fails with ERROR_INVALID_PARAMETER, which would leave
++                // d3d11/dxgi unloadable and force software rendering. An
++                // absolute system32 path is search-order-safe and needs no
++                // flag support; on Win8+ the call above already succeeded.
++                WCHAR systemDir[MAX_PATH];
++                UINT systemDirLen = GetSystemDirectoryW(systemDir, MAX_PATH);
++                if (0 < systemDirLen && systemDirLen < MAX_PATH)
++                {
++                    std::wstring absolutePath =
++                        std::wstring(systemDir) + L'\\' + Widen(libraryName);
++                    libraryModule = LoadLibraryW(absolutePath.c_str());
++                }
++            }
+             if (libraryModule == nullptr && errorOut)
+             {
+                 *errorOut =

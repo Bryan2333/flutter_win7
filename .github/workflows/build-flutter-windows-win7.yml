@@ -1,0 +1,197 @@
+# Builds Windows 7-compatible flutter_windows.dll artifacts from the Flutter
+# engine sources: YY-Thunks supplies the APIs Windows 7 lacks, patches/ covers
+# what is not visible in the import table. One job per runtime mode (they run in
+# parallel, each with its own runner and disk) and the zips end up on a release.
+# Manual trigger only; one engine build takes ~1 hour per job.
+name: build-flutter-windows-win7
+
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_ref:
+        description: Flutter tag or commit (used as gclient "url@revision")
+        default: "3.41.9"
+      yy_thunks_tag:
+        description: YY-Thunks release tag (>= v1.2.2 has the Flutter thunks)
+        default: "v1.2.2"
+      runtime_modes:
+        description: Comma-separated runtime modes, one parallel job each (no spaces)
+        default: "release,debug,profile"
+      release_tag:
+        description: Tag to publish, including its own revision, e.g. v3.41.9-win7-1 (default v<flutter_ref>-win7-1)
+        default: ""
+
+env:
+  FLUTTER_REF: ${{ inputs.flutter_ref || '3.41.9' }}
+  YY_THUNKS_TAG: ${{ inputs.yy_thunks_tag || 'v1.2.2' }}
+  RUNTIME_MODES: ${{ inputs.runtime_modes || 'release,debug,profile' }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  ENGINE_ROOT: ${{ github.workspace }}\..\engine-root
+
+# gh release create/upload needs write access to the repository contents.
+permissions:
+  contents: write
+
+jobs:
+  # Turns the comma-separated input into the matrix below (GitHub expressions
+  # have no split/replace, so this needs a job) and resolves the release tag up
+  # front, so a bad one fails in seconds instead of after every build.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      modes: ${{ steps.modes.outputs.modes }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: modes
+        run: python3 -c "import json,os;m=[x.strip() for x in os.environ['RUNTIME_MODES'].split(',') if x.strip()] or ['release','debug','profile'];print('modes='+json.dumps(m))" >> "$GITHUB_OUTPUT"
+      - id: tag
+        run: |
+          tag="${RELEASE_TAG:-v${FLUTTER_REF}-win7-1}"
+          git check-ref-format "refs/tags/$tag" || { echo "invalid release tag: '$tag'" >&2; exit 1; }
+          echo "release tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ${{ fromJSON(needs.prepare.outputs.modes) }}
+    # The engine pins VS 2022 + Windows SDK 10.0.22621.0
+    # (build/toolchain/win/setup_toolchain.py); windows-2022 ships exactly that.
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUNTIME_MODE: ${{ matrix.mode }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install depot_tools
+        run: |
+          git config --global core.longpaths true
+          # LF checkouts: ANGLE's .gitattributes says "* text=auto", and the
+          # patches only match LF sources.
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          # Full clone: on Windows depot_tools bootstraps its own pinned git.
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$env:GITHUB_WORKSPACE\..\depot_tools"
+          Add-Content $env:GITHUB_PATH "$env:GITHUB_WORKSPACE\..\depot_tools"
+          # Use the runner's VS toolchain instead of Google's internal one.
+          Add-Content $env:GITHUB_ENV "DEPOT_TOOLS_WIN_TOOLCHAIN=0"
+          & "$env:GITHUB_WORKSPACE\..\depot_tools\gclient.bat" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Check out engine source
+        run: |
+          mkdir "$env:ENGINE_ROOT"
+          cd "$env:ENGINE_ROOT"
+          $spec = 'solutions = [{"managed": False, "name": ".", "url": "https://github.com/flutter/flutter.git@' + $env:FLUTTER_REF + '", "custom_deps": {}, "custom_vars": {"download_android_deps": False, "download_jdk": False, "use_rbe": False}, "deps_file": "DEPS", "safesync_url": ""}]'
+          Set-Content -Path .gclient -Value $spec
+          gclient sync --no-history -j8
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Fetch YY-Thunks release
+        run: |
+          # YY-Thunks-Objs.zip ships objs/<arch>/*.obj plus the target-OS API
+          # database (Config/) and YY.Depends.Analyzer.exe.
+          $base = "https://github.com/Chuyu-Team/YY-Thunks/releases/download/$env:YY_THUNKS_TAG"
+          Invoke-WebRequest "$base/YY-Thunks-Objs.zip" -OutFile yy-objs.zip
+          Expand-Archive yy-objs.zip -DestinationPath yy-thunks -Force
+          $obj = "yy-thunks\objs\x64\YY_Thunks_for_Win7.obj"
+          if (-not (Test-Path $obj)) { throw "unexpected YY-Thunks-Objs.zip layout: $obj missing" }
+          $dst = "$env:ENGINE_ROOT\engine\src\third_party\yy_thunks"
+          New-Item -ItemType Directory -Force "$dst\objs\x64" | Out-Null
+          Copy-Item $obj "$dst\objs\x64\"
+
+      - name: Apply patches
+        run: |
+          # Two traps this function exists for:
+          #  * git apply silently SKIPS (exit 0) a patch whose path is not under
+          #    the current directory relative to its repo root, so each patch runs
+          #    in the root of the checkout its paths are relative to;
+          #  * patches arrive as CRLF from a Windows checkout while the sources are
+          #    LF, so they are normalised first.
+          # The marker check turns any skip that still slips through into a failure.
+          function Apply-Patch($repo, $patch, $markerFile, $marker) {
+            $lf = Join-Path $env:RUNNER_TEMP "$([IO.Path]::GetFileName($patch)).lf"
+            [IO.File]::WriteAllBytes($lf, [byte[]]([IO.File]::ReadAllBytes("$env:GITHUB_WORKSPACE\$patch") | Where-Object { $_ -ne 13 }))
+            Push-Location (Join-Path $env:ENGINE_ROOT $repo)
+            try {
+              git apply --verbose $lf
+              if ($LASTEXITCODE -ne 0) { git apply -C1 --verbose $lf }
+              if ($LASTEXITCODE -ne 0) { throw "failed to apply $patch in $repo" }
+            } finally { Pop-Location }
+            if (-not (Select-String -Path (Join-Path $env:ENGINE_ROOT $markerFile) -Pattern $marker -SimpleMatch -Quiet)) {
+              throw "$patch did not change $markerFile"
+            }
+          }
+          Apply-Patch "engine\src\flutter\third_party\boringssl\src" "patches\boringssl-0001-win7-rtlgenrandom-fallback.patch" "engine\src\flutter\third_party\boringssl\src\crypto\rand\windows.cc" "RtlGenRandomFunction"
+          Apply-Patch "engine\src\flutter\third_party\skia" "patches\skia-0001-win7-dwrite-load-fallback.patch" "engine\src\flutter\third_party\skia\src\utils\win\SkDWrite.cpp" "Win7 compat"
+          Apply-Patch "engine\src\flutter\third_party\angle" "patches\angle-0002-win7-system-library-load.patch" "engine\src\flutter\third_party\angle\src\common\system_utils_win32.cpp" "Win7 compat"
+          Apply-Patch "." "patches\flutter-0002-win7-software-compositor.patch" "engine\src\flutter\shell\platform\windows\egl\manager.cc" "IsBelowWindows10"
+          Apply-Patch "." "patches\yy-thunks-obj.patch" "engine\src\flutter\shell\platform\windows\BUILD.gn" "YY_Thunks_for_Win7.obj"
+
+      - name: Build ${{ matrix.mode }}
+        run: |
+          $mode = $env:RUNTIME_MODE.Trim()
+          cd "$env:ENGINE_ROOT\engine\src"
+          python .\flutter\tools\gn --runtime-mode=$mode
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Fail before the long build if the YY-Thunks object never reached the link line.
+          $ninja = Get-ChildItem -Recurse -Filter flutter_windows.ninja "out\host_$mode" | Select-Object -First 1
+          if (-not $ninja) { throw "out\host_${mode}: flutter_windows.ninja not found" }
+          if (-not (Select-String -Path $ninja.FullName -Pattern "YY_Thunks_for_Win7.obj" -SimpleMatch -Quiet)) {
+            throw "YY-Thunks object is not on the link line"
+          }
+          ninja -C "out\host_$mode" flutter/shell/platform/windows:flutter_windows
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Verify import table
+        run: |
+          $mode = $env:RUNTIME_MODE.Trim()
+          $dll = "$env:ENGINE_ROOT\engine\src\out\host_$mode\flutter_windows.dll"
+          python tools\check_win7_imports.py $dll --db yy-thunks\Config --arch x64 --os 6.1.7600 2>&1 | Tee-Object -Variable report
+          if ($LASTEXITCODE -ne 0) { throw "still imports APIs that are missing on Windows 7" }
+          "--- $mode" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $report | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Package zip
+        run: |
+          $mode = $env:RUNTIME_MODE.Trim()
+          $out = "$env:ENGINE_ROOT\engine\src\out\host_$mode"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Force -DestinationPath "dist\flutter_windows-win7-$($env:FLUTTER_REF)-$mode-x64.zip" -Path `
+            "$out\flutter_windows.dll", "$out\flutter_windows.dll.lib", "$out\flutter_windows.dll.exp", "$out\flutter_windows.dll.pdb"
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $mode = $env:RUNTIME_MODE.Trim()
+          $tag = $env:TAG
+          # Parallel jobs may race to create the same release; whoever loses just
+          # re-checks that it now exists. Uploads are per-mode, so --clobber only
+          # replaces this job's own asset.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $notes = @(
+              "flutter_windows.dll built from the Flutter $($env:FLUTTER_REF) engine sources with the YY-Thunks $($env:YY_THUNKS_TAG) stub object and the patches in patches/.",
+              '',
+              'Every asset passed tools/check_win7_imports.py against the Windows 7 API database: 0 missing imports.',
+              '',
+              'Install: unzip the matching mode into <flutter>/bin/cache/artifacts/engine/windows-x64[-release|-profile]/ and build your app normally.'
+            ) -join "`n"
+            gh release create $tag --title "flutter_windows.dll $($env:FLUTTER_REF) for Windows 7" --notes $notes
+            if ($LASTEXITCODE -ne 0) {
+              gh release view $tag *> $null
+              if ($LASTEXITCODE -ne 0) { throw "cannot create or find release $tag" }
+            }
+          }
+          gh release upload $tag "dist\flutter_windows-win7-$($env:FLUTTER_REF)-$mode-x64.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "failed to upload the $mode asset to $tag" }

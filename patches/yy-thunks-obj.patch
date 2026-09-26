@@ -1,0 +1,34 @@
+diff --git a/engine/src/flutter/shell/platform/windows/BUILD.gn b/engine/src/flutter/shell/platform/windows/BUILD.gn
+index 6c54793..1f24593 100644
+--- a/engine/src/flutter/shell/platform/windows/BUILD.gn
++++ b/engine/src/flutter/shell/platform/windows/BUILD.gn
+@@ -199,6 +199,29 @@ shared_library("flutter_windows") {
+   deps = [ ":flutter_windows_source" ]
+ 
+   public_configs = [ "//flutter:config" ]
++
++  # --- Windows 7 support ---------------------------------------------------
++  # YY-Thunks (https://github.com/Chuyu-Team/YY-Thunks) implements the APIs
++  # that Windows 7 does not have (WaitOnAddress/WakeByAddressSingle,
++  # PathCchCombineEx/PathAllocCanonicalize/PathCchRemoveFileSpec,
++  # GetCurrentThreadStackLimits, RtlAddGrowableFunctionTable/
++  # RtlDeleteGrowableFunctionTable, GetHostNameW) by resolving them at runtime
++  # through LoadLibrary/GetProcAddress and falling back to an implementation.
++  #
++  # The object file also defines the __imp_* aliases for them, so linking it
++  # keeps those APIs out of this DLL's import table. Without it,
++  # LoadLibrary("flutter_windows.dll") fails on Windows 7 with messages such as
++  # "api-ms-win-core-synch-l1-2-0.dll is missing". It must be an MSVC-linked
++  # object built from the YY-Thunks sources with YY_Thunks_Target=__WindowsNT6_1
++  # (shipped in YY-Thunks-Objs.zip).
++  #
++  # Passed through ldflags and not libs: a libs entry is registered as a ninja
++  # input path, which ninja resolves against this target's output directory and
++  # then rejects with "missing and no known rule to make it".
++  ldflags = [
++    rebase_path("//third_party/yy_thunks/objs/x64/YY_Thunks_for_Win7.obj",
++                root_build_dir),
++  ]
+ }
+ 
+ test_fixtures("flutter_windows_fixtures") {

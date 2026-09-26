@@ -1,0 +1,60 @@
+diff --git a/crypto/rand/windows.cc b/crypto/rand/windows.cc
+index 6a93a2d..dc3a736 100644
+--- a/crypto/rand/windows.cc
++++ b/crypto/rand/windows.cc
+@@ -58,13 +58,29 @@
+ typedef BOOL (WINAPI *ProcessPrngFunction)(PBYTE pbData, SIZE_T cbData);
+ static ProcessPrngFunction g_processprng_fn = nullptr;
+ 
++// Win7 compat: ProcessPrng is how every modern Windows seeds BoringSSL, but
++// Windows 7 cannot provide it, and upstream's answer to that is a
++// message-less abort() on the first random-number request — in practice the
++// first TLS handshake. Fall back to RtlGenRandom
++// (advapi32!SystemFunction036, XP+), the exact path BoringSSL shipped for
++// the years it supported Win7, resolved dynamically so Win8+ keeps the
++// ProcessPrng path untouched.
++typedef BOOLEAN(WINAPI *RtlGenRandomFunction)(PVOID buffer, ULONG length);
++static RtlGenRandomFunction g_rtlgenrandom_fn = nullptr;
++
+ static void init_processprng(void) {
+   HMODULE hmod = LoadLibraryW(L"bcryptprimitives");
+-  if (hmod == nullptr) {
+-    abort();
++  if (hmod != nullptr) {
++    g_processprng_fn = (ProcessPrngFunction)GetProcAddress(hmod, "ProcessPrng");
+   }
+-  g_processprng_fn = (ProcessPrngFunction)GetProcAddress(hmod, "ProcessPrng");
+   if (g_processprng_fn == nullptr) {
++    HMODULE advapi = LoadLibraryW(L"advapi32");
++    if (advapi != nullptr) {
++      g_rtlgenrandom_fn =
++          (RtlGenRandomFunction)GetProcAddress(advapi, "SystemFunction036");
++    }
++  }
++  if (g_processprng_fn == nullptr && g_rtlgenrandom_fn == nullptr) {
+     abort();
+   }
+ }
+@@ -76,6 +92,22 @@
+ 
+ void CRYPTO_sysrand(uint8_t *out, size_t requested) {
+   CRYPTO_init_sysrand();
++  if (g_processprng_fn == nullptr) {
++    // The RtlGenRandom fallback (see init_processprng). It takes a ULONG,
++    // so chunk exactly the way BoringSSL's own Win7-era implementation did.
++    while (requested > 0) {
++      ULONG output_bytes_this_pass = ULONG_MAX;
++      if (requested < output_bytes_this_pass) {
++        output_bytes_this_pass = (ULONG)requested;
++      }
++      if (!g_rtlgenrandom_fn(out, output_bytes_this_pass)) {
++        abort();
++      }
++      requested -= output_bytes_this_pass;
++      out += output_bytes_this_pass;
++    }
++    return;
++  }
+   // On non-UWP configurations, use ProcessPrng instead of BCryptGenRandom
+   // to avoid accessing resources that may be unavailable inside the
+   // Chromium sandbox. See https://crbug.com/74242
